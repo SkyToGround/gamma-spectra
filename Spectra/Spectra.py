@@ -13,12 +13,84 @@ class Spectra:
 		fl.close()
 		if (struct.unpack("<h", data[0:2])[0] == -1):
 			self.read_as_chn(filename)
+		elif (struct.unpack("<h", data[0:2])[0] == -13):
+			self.read_as_list_mode(filename)
 		elif (struct.unpack("<hh", data[0:4]) == (1,1)):
+			self.filename = filename
 			self.read_as_binary(filename)
 		elif (filename[-3:] == "IEC" or filename[-3:] == "iec"):
 			self.read_as_iec(filename)
 		else:
 			self.read_as_text_new(filename)
+	
+	def read_as_list_mode_alt(self, filename):
+		fl = open(filename, "r")
+		fl.seek(256)
+		in_data = fl.read()
+		times = []
+		amplitudes = []
+		big_clock = 0
+		start_clock = 0
+		self.spectra = numpy.zeros([2048])
+		time_multi = 0
+		old_c_time = 0
+		for i in range(len(in_data) / 4):
+			c_data = in_data[i * 4: i * 4 + 4]
+			pkg = struct.unpack("<I", c_data)[0]
+			pkg_type = (pkg & 0x80000000) >> 31
+			if (pkg_type == 0):
+				c_time = (pkg & 0x1FFFFF)
+				c_amp = (pkg & 0x7FF00000) >> 20
+				times.append(c_time + big_clock)
+				amplitudes.append(c_amp)
+				self.spectra[c_amp] += 1
+			else:
+				c_time = pkg & 0x7FE00000
+				if (c_time < old_c_time):
+					time_multi += 1
+				old_c_time = c_time
+				if (start_clock == 0):
+					start_clock = c_time
+				else:
+					big_clock = c_time - start_clock + time_multi * 0x7FE00000
+		self.pulse_times = numpy.array(times) / 1e6
+		self.pulse_amps = numpy.array(amplitudes)
+	
+	def read_as_list_mode(self, filename):
+		fl = open(filename, "r")
+		fl.seek(256)
+		in_data = fl.read()
+		times = []
+		amplitudes = []
+		self.spectra = numpy.zeros([1024,])
+		self.channels = 1024
+		prev_time = 0
+		big_time = 0
+		prev_big_time = 0
+		for i in range(len(in_data) / 4):
+			c_data = in_data[i * 4: i * 4 + 4]
+			pkg = struct.unpack("<I", c_data)[0]
+			pkg_type = (pkg & 0x80000000) >> 31
+			if (pkg_type == 0):
+				c_time = (pkg & 0x1FFFFF)
+				c_amp = (pkg & 0x7FE00000) >> 21
+				# if (c_time < prev_time):
+				# 	big_time += 0x200000
+				prev_time = c_time
+				times.append(c_time + big_time)
+				amplitudes.append(c_amp)
+				self.spectra[c_amp] += 1
+			else:
+				c_time = pkg & 0x7fffffff
+				c_amp = 0x1FFF
+				times.append(c_time)
+				amplitudes.append(c_amp)
+				#print "Time event!"
+				pass
+				#fix me!
+				#does not take the "time only" events into account
+		self.pulse_times = numpy.array(times)
+		self.pulse_amps = numpy.array(amplitudes)
 	
 	def read_as_iec(self, filename):
 		fl = open(filename, "r")
@@ -260,13 +332,30 @@ class Spectra:
 		self.C = res1[9]
 		#print A, B, C
 		channels = numpy.arange(self.channels)
-		self.energy_calibration = self.A + channels * self.B# + channels**self.C
+		if (self.C != None and self.C != 0):
+			self.energy_calibration = self.A + channels * self.B + channels**self.C
+		else:
+			self.energy_calibration = self.A + channels * self.B
 	
 	def calculate_channel(self, energy):
 		return (energy - self.A) / self.B
 	
 	def calculate_energy(self, channel):
 		return self.A + self.B * channel
+	
+	def save_en_cal(self):
+		out_file = open(self.filename, "r+w+b")
+		save_data = struct.pack("<fff", self.A, self.B, self.C)
+		first_part_size = struct.calcsize("<hhhhfff")
+		CALRP1 = self.meta_data["CALRP1"]
+		out_file.seek((CALRP1 - 1) * 128 + first_part_size)
+		out_file.write(save_data)
+		out_file.close()
+	
+	def sum_en_range(self, low_en, high_en):
+		low_ch = int(self.calculate_channel(low_en))
+		high_ch = int(self.calculate_channel(high_en))
+		return self.spectra[low_ch:high_ch].sum()
 	
 	def redo_energy_cal(self, A = None, B = None, C = None):
 		if (A != None):
@@ -278,37 +367,22 @@ class Spectra:
 		channels = numpy.arange(self.channels)
 		self.energy_calibration = self.A + channels * self.B
 	
+	def linear_en_cal(self, channels, energies):
+		from scipy.stats import linregress
+		slope, intercept, r_value, p_value, std_err = linregress(channels, energies)
+		self.redo_energy_cal(intercept, slope)
+	
 	def show_spectra(self):
 		import pylab as pl
 		fig = pl.figure()
 		ax1 = fig.add_subplot(111)
 		channel_arr = numpy.arange(self.channels)
 		ax1.plot(channel_arr, self.spectra, lw = 2, color = "blue")
-		# for tl in ax1.get_yticklabels():
-		#     tl.set_color('b')
-		ax1.set_xlabel("Tid")
-		ax1.set_ylabel(u"Höjd")
-		ax2 = ax1.twinx()
-		ax2.plot(time_data[start:stop], abs(vert_vel[start-1:stop]), lw = 2, color = "red")
-		#pl.plot(time_data[start:stop], abs(vert_vel[start-1:stop]))
-		ax2.set_ylabel("Hastighet (m/s)")
-		for tl in ax2.get_yticklabels():
-		    tl.set_color('r')
+		ax1.set_xlabel("Pulses per channel")
+		ax1.set_ylabel(u"Channel")
 		pl.show()
 		
 
 if __name__ == '__main__':
-	#spc = Spectra("bkg_mat_hemma/bkg_matning_hpge_000.spc")
-	spc = Spectra("Obpri_Parkinglot_2A.Spc")
-	from pylab import plot, show
-	plot(spc.energy_calibration, spc.spectra)
-	show()
-	#spc = Spectra("../length/pos_000.spc")
-	#variables = ["SPCRCN", "SPCCHN", "ABSTCH", "ACQTIM", "ACQTI8", "SEQNUM", "MCANU", "SEGNUM", "MCADVT", "CHNSRT", "RLTMDT", "LVTMDT"]
-	#for a in variables:
-	#	try:
-	#		print a + ": " + str(spc.meta_data[a])
-	#	except:
-	#		print "Failed to locate the variable \"" + a + "\""
-	# plot(spc.spectra)
-	# show()
+	spc = Spectra("Helsinki/labr_bara_bkg.Spc")
+	print spc.B
