@@ -58,6 +58,11 @@ class Spectra:
 	
 	def read_as_list_mode(self, filename):
 		fl = open(filename, "r")
+		header_data = fl.read(256)
+		head_res = struct.unpack("<IId80s9s16s80sc4sfffcfffIIff9s", header_data)
+		self.realtime = head_res[18]
+		self.livetime = head_res[19]
+		
 		fl.seek(256)
 		in_data = fl.read()
 		times = []
